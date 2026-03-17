@@ -1,49 +1,32 @@
-# server.py
 import argparse
 import json
 import os
 import threading
 from pathlib import Path
-
+import sys
+import subprocess
+import socket
+import time
 import cv2
 import numpy as np
+
 from mss import mss
-
-# Symmetric encryption (password-derived key). No public/private keys used.
-# Preferred backend: `cryptography` (AESGCM). Fallback: `pycryptodome` (AES GCM).
-try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    from cryptography.hazmat.primitives import hashes
-except Exception:
-    AESGCM = None
-    PBKDF2HMAC = None
-    hashes = None
-
-# Fallback backend (often installed as `pycryptodome`)
-try:
-    from Crypto.Cipher import AES as PYAES
-    from Crypto.Protocol.KDF import PBKDF2 as PYPBKDF2
-    from Crypto.Hash import SHA256 as PYSHA256
-except Exception:
-    PYAES = None
-    PYPBKDF2 = None
-    PYSHA256 = None
-
-# NOTE: Kept for compatibility in case UI/side effects are expected elsewhere.
-# If unused in your project, you can remove this import safely.
-from InterFace import *
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+from Crypto.Cipher import AES as PYAES
+from Crypto.Protocol.KDF import PBKDF2 as PYPBKDF2
+from Crypto.Hash import SHA256 as PYSHA256
 
 from proto import (
-    ANNOUNCE_PORT,
-    DEFAULT_GROUP,
-    DEFAULT_PORT,
-    MAX_DATAGRAM,
-    HEADER_SIZE,
-    pack_header,
+    BROADCAST_DISCOVERY_PORT,
+    DEFAULT_MULTICAST_GROUP_IP,
+    DEFAULT_MULTICAST_PORT,
+    MAXIMUM_DATAGRAM_SIZE_BYTES,
+    HEADER_SIZE_IN_BYTES,
+    create_packet_header,
 )
 
-# Local control channel (UI -> Server)
 CONTROL_HOST = "127.0.0.1"
 CONTROL_PORT = 50099
 CONTROL_TOGGLE_STOP = b"toggle_stop_sender"
@@ -51,390 +34,296 @@ CONTROL_TOGGLE_GO = b"toggle_go_sender"
 CONTROL_FREEZE = b"freeze_ten_times"
 CONTROL_UNFREEZE = b"unfreeze_ten_times"
 CONTROL_DEATH = b"death_message"
-
-# Prefix: UI sends b"set_password:" + password_bytes
 CONTROL_SET_PASSWORD_PREFIX = b"set_password:"
 
-def make_multicast_sender(group: str, port: int):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)  # Create a UDP socket using IPv4
-    # Optional: enable TTL if crossing subnets (default=1 => local)
-    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)  # Set the TTL for multicast packets to 1 (local network only)
-    addr = (group, port)  # Tuple of multicast group address and port
-    return s, addr  # Return the socket and the multicast address tuple
 
-def broadcaster(name: str, group: str, port: int, fps: int, width: int, height: int):
-    """Prepare a broadcast socket + announcement template for discovery."""
-    msg = {
+def create_multicast_sender_socket(group_ip: str, port: int):
+    sender_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sender_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+    multicast_address = (group_ip, port)
+    return sender_socket, multicast_address
+
+def create_discovery_broadcaster(server_name: str, group_ip: str, port: int, fps: int, width: int):
+    announcement_message = {
         "type": "screenshare_announce",
-        "name": name,
-        "group": group,
+        "name": server_name,
+        "group": group_ip,
         "port": port,
         "fps": fps,
         "width": width,
-        "height": height,
+        "height": 0,
         "ts": time.time(),
     }
-    b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    b.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    return b, msg
+    broadcaster_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    broadcaster_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    return broadcaster_socket, announcement_message
 
+_is_stop_command_loop_running = False
+_stop_command_thread = None
+_is_go_command_loop_running = False
+_go_command_thread = None
 
-#shut down system
+_is_encryption_active = False
+_encryption_salt = None
+_active_crypto_backend = None
+_aesgcm_instance = None
+_pycrypto_key_bytes = None
 
+def derive_encryption_key_and_enable(password_string: str) -> None:
+    global _is_encryption_active, _encryption_salt, _active_crypto_backend, _aesgcm_instance, _pycrypto_key_bytes
 
-
-_stop_sender_running = False
-_stop_sender_thread = None
-_go_sender_running = False
-_go_sender_thread = None
-
-
-# --- Encryption state (set via UI confirm) ---
-_crypto_enabled = False
-_crypto_salt = None  # 16 bytes
-_crypto_backend = None  # "cryptography" or "pycryptodome"
-_crypto_aesgcm = None  # cryptography AESGCM instance
-_crypto_key = None     # bytes for pycryptodome backend
-
-def set_password_encryption(password: str) -> None:
-    """Derive a symmetric key from the UI password and enable encryption.
-
-    Backend preference order:
-      1) cryptography (AES-GCM)
-      2) pycryptodome (AES GCM)
-
-    The salt is generated once per server run (or per password set) and is prepended
-    to each encrypted frame.
-    """
-    global _crypto_enabled, _crypto_salt, _crypto_backend, _crypto_aesgcm, _crypto_key
-
-    pw = (password or "").encode("utf-8")
-    if not pw:
-        print("[CRYPTO] Empty password; encryption disabled")
-        _crypto_enabled = False
-        _crypto_salt = None
-        _crypto_backend = None
-        _crypto_aesgcm = None
-        _crypto_key = None
+    password_bytes = (password_string or "").encode("utf-8")
+    if not password_bytes:
+        _is_encryption_active = False
+        _encryption_salt, _active_crypto_backend, _aesgcm_instance, _pycrypto_key_bytes = None, None, None, None
         return
 
-    _crypto_salt = os.urandom(16)
+    _encryption_salt = os.urandom(16)
 
-    # --- Preferred backend: cryptography ---
     if AESGCM is not None and PBKDF2HMAC is not None and hashes is not None:
         try:
             kdf = PBKDF2HMAC(
                 algorithm=hashes.SHA256(),
                 length=32,
-                salt=_crypto_salt,
+                salt=_encryption_salt,
                 iterations=200_000,
             )
-            key = kdf.derive(pw)
-            _crypto_aesgcm = AESGCM(key)
-            _crypto_key = None
-            _crypto_backend = "cryptography"
-            _crypto_enabled = True
-            print("[CRYPTO] Encryption enabled (AES-GCM via cryptography)")
+            key = kdf.derive(password_bytes)
+            _aesgcm_instance = AESGCM(key)
+            _pycrypto_key_bytes = None
+            _active_crypto_backend = "cryptography"
+            _is_encryption_active = True
             return
-        except Exception as ex:
-            print(f"[CRYPTO] cryptography backend failed: {ex}")
+        except Exception:
+            pass
 
-    # --- Fallback backend: pycryptodome ---
     if PYAES is not None and PYPBKDF2 is not None and PYSHA256 is not None:
         try:
-            key = PYPBKDF2(pw, _crypto_salt, dkLen=32, count=200_000, hmac_hash_module=PYSHA256)
-            _crypto_key = key
-            _crypto_aesgcm = None
-            _crypto_backend = "pycryptodome"
-            _crypto_enabled = True
-            print("[CRYPTO] Encryption enabled (AES-GCM via pycryptodome)")
+            _pycrypto_key_bytes = PYPBKDF2(password_bytes, _encryption_salt, dkLen=32, count=200_000, hmac_hash_module=PYSHA256)
+            _aesgcm_instance = None
+            _active_crypto_backend = "pycryptodome"
+            _is_encryption_active = True
             return
-        except Exception as ex:
-            print(f"[CRYPTO] pycryptodome backend failed: {ex}")
+        except Exception:
+            pass
 
-    # No backend available
-    print("[CRYPTO] No supported crypto backend found (install 'cryptography' or 'pycryptodome'); encryption disabled")
-    _crypto_enabled = False
-    _crypto_salt = None
-    _crypto_backend = None
-    _crypto_aesgcm = None
-    _crypto_key = None
+    _is_encryption_active = False
+    _encryption_salt, _active_crypto_backend, _aesgcm_instance, _pycrypto_key_bytes = None, None, None, None
 
 
-def encrypt_frame_bytes(plain: bytes, frame_id: int) -> bytes:
-    """Encrypt one frame.
-
-    Output format:
-        b"ENC1" + salt(16) + nonce(12) + ciphertext + tag(16)
-
-    For the cryptography backend, AESGCM returns ciphertext+tag, so we split the last 16 bytes.
-    """
-    if not _crypto_enabled or _crypto_salt is None:
-        return plain
+def encrypt_payload(plaintext_bytes: bytes, frame_id: int) -> bytes:
+    if not _is_encryption_active or _encryption_salt is None:
+        return plaintext_bytes
 
     nonce = os.urandom(12)
-    aad = frame_id.to_bytes(4, "big", signed=False)
+    associated_data = frame_id.to_bytes(4, "big", signed=False)
 
-    if _crypto_backend == "cryptography" and _crypto_aesgcm is not None:
+    if _active_crypto_backend == "cryptography" and _aesgcm_instance is not None:
         try:
-            ct_and_tag = _crypto_aesgcm.encrypt(nonce, plain, aad)
-            if len(ct_and_tag) < 16:
-                return plain
-            ciphertext = ct_and_tag[:-16]
-            tag = ct_and_tag[-16:]
-            return b"ENC1" + _crypto_salt + nonce + ciphertext + tag
+            ciphertext_and_tag = _aesgcm_instance.encrypt(nonce, plaintext_bytes, associated_data)
+            if len(ciphertext_and_tag) < 16:
+                return plaintext_bytes
+            ciphertext = ciphertext_and_tag[:-16]
+            authentication_tag = ciphertext_and_tag[-16:]
+            return b"ENC1" + _encryption_salt + nonce + ciphertext + authentication_tag
         except Exception:
-            return plain
+            return plaintext_bytes
 
-    if _crypto_backend == "pycryptodome" and _crypto_key is not None and PYAES is not None:
+    if _active_crypto_backend == "pycryptodome" and _pycrypto_key_bytes is not None and PYAES is not None:
         try:
-            cipher = PYAES.new(_crypto_key, PYAES.MODE_GCM, nonce=nonce)
-            cipher.update(aad)
-            ciphertext, tag = cipher.encrypt_and_digest(plain)
-            return b"ENC1" + _crypto_salt + nonce + ciphertext + tag
+            cipher = PYAES.new(_pycrypto_key_bytes, PYAES.MODE_GCM, nonce=nonce)
+            cipher.update(associated_data)
+            ciphertext, authentication_tag = cipher.encrypt_and_digest(plaintext_bytes)
+            return b"ENC1" + _encryption_salt + nonce + ciphertext + authentication_tag
         except Exception:
-            return plain
+            return plaintext_bytes
 
-    return plain
+    return plaintext_bytes
 
-def toggle_stop_sender(sock, addr):
-    """Toggle a background task that sends 'stop' every second.
 
-    If GO loop is running, it will be stopped first.
-    Call again to stop the STOP loop.
-    """
-    global _stop_sender_running, _stop_sender_thread
-    global _go_sender_running
+def start_looping_stop_command(sender_socket, multicast_address):
+    global _is_stop_command_loop_running, _stop_command_thread, _is_go_command_loop_running
+    
+    _is_go_command_loop_running = False
 
-    def _send_loop():
-        global _stop_sender_running
-        while _stop_sender_running:
+    def loop_stop_command():
+        while _is_stop_command_loop_running:
             try:
-                sock.sendto(b"stop", addr)
+                sender_socket.sendto(b"stop", multicast_address)
             except Exception:
                 pass
             time.sleep(1)
 
-    # If GO is running, stop it when STOP is requested
-    _go_sender_running = False
-
-    if not _stop_sender_running:
-        _stop_sender_running = True
-        _stop_sender_thread = threading.Thread(target=_send_loop, daemon=True)
-        _stop_sender_thread.start()
+    if not _is_stop_command_loop_running:
+        _is_stop_command_loop_running = True
+        _stop_command_thread = threading.Thread(target=loop_stop_command, daemon=True)
+        _stop_command_thread.start()
     else:
-        _stop_sender_running = False
+        _is_stop_command_loop_running = False
 
+def start_looping_go_command(sender_socket, multicast_address):
+    global _is_go_command_loop_running, _go_command_thread, _is_stop_command_loop_running
+    
+    _is_stop_command_loop_running = False
 
-# Alias kept for requested naming style
-
-toggleStopSender = toggle_stop_sender
-
-def toggle_go_sender(sock, addr):
-    """Toggle a background task that sends 'go' every second.
-
-    If STOP loop is running, it will be stopped first.
-    Call again to stop the GO loop.
-    """
-    global _go_sender_running, _go_sender_thread
-    global _stop_sender_running
-
-    def _send_loop():
-        global _go_sender_running
-        while _go_sender_running:
+    def loop_go_command():
+        while _is_go_command_loop_running:
             try:
-                sock.sendto(b"go", addr)
+                sender_socket.sendto(b"go", multicast_address)
             except Exception:
                 pass
             time.sleep(1)
 
-    # If STOP is running, stop it when GO is requested
-    _stop_sender_running = False
-
-    if not _go_sender_running:
-        _go_sender_running = True
-        _go_sender_thread = threading.Thread(target=_send_loop, daemon=True)
-        _go_sender_thread.start()
+    if not _is_go_command_loop_running:
+        _is_go_command_loop_running = True
+        _go_command_thread = threading.Thread(target=loop_go_command, daemon=True)
+        _go_command_thread.start()
     else:
-        _go_sender_running = False
+        _is_go_command_loop_running = False
 
-
-# Alias kept for requested naming style
-
-toggleGoSender = toggle_go_sender
-
-def send_freeze_ten_times(sock, addr):
-    """
-    Sends the word 'freeze' ten times in a row
-    to the given socket and address.
-    """
-    for _ in range(10):
+def send_burst_command(sender_socket, multicast_address, command_string: str, repetitions: int = 10):
+    command_bytes = command_string.encode('utf-8')
+    for _ in range(repetitions):
         try:
-            sock.sendto(b"freeze", addr)
+            sender_socket.sendto(command_bytes, multicast_address)
         except Exception:
             pass
 
-def send_unfreeze_ten_times(sock, addr):
-    """
-    Sends the word 'freeze' ten times in a row
-    to the given socket and address.
-    """
-    for _ in range(10):
-        try:
-            sock.sendto(b"unfreeze", addr)
-        except Exception:
-            pass
-
-def send_death_message(sock, addr):
-    """
-    Sends the word 'death' once to the given socket and address.
-    """
+def start_ui_process():
     try:
-        sock.sendto(b"death", addr)
+        ui_script_path = Path(__file__).with_name("interface.py")
+        return subprocess.Popen([sys.executable, str(ui_script_path), "--managed"])
+    except Exception:
+        return None
+
+def process_control_socket_commands(control_socket, sender_socket, multicast_address):
+    try:
+        incoming_command, _ = control_socket.recvfrom(1024)
+        incoming_command = incoming_command.strip()
+
+        if incoming_command.startswith(CONTROL_SET_PASSWORD_PREFIX):
+            password_bytes = incoming_command[len(CONTROL_SET_PASSWORD_PREFIX):]
+            password_string = password_bytes.decode("utf-8", errors="ignore").strip()
+            derive_encryption_key_and_enable(password_string)
+        elif incoming_command == CONTROL_TOGGLE_STOP:
+            start_looping_stop_command(sender_socket, multicast_address)
+        elif incoming_command == CONTROL_TOGGLE_GO:
+            start_looping_go_command(sender_socket, multicast_address)
+        elif incoming_command == CONTROL_FREEZE:
+            send_burst_command(sender_socket, multicast_address, "freeze")
+        elif incoming_command == CONTROL_UNFREEZE:
+            send_burst_command(sender_socket, multicast_address, "unfreeze")
+        elif incoming_command == CONTROL_DEATH:
+            send_burst_command(sender_socket, multicast_address, "death", repetitions=1)
+    except BlockingIOError:
+        pass
     except Exception:
         pass
 
+def capture_and_encode_screen(screen_capture_tool, capture_monitor, target_width: int, jpeg_quality: int):
+    raw_capture = screen_capture_tool.grab(capture_monitor)
+    image_array = np.array(raw_capture)
+    bgr_image = cv2.cvtColor(image_array, cv2.COLOR_BGRA2BGR)
+
+    if target_width and bgr_image.shape[1] != target_width:
+        scaled_height = int(bgr_image.shape[0] * (target_width / bgr_image.shape[1]))
+        bgr_image = cv2.resize(bgr_image, (target_width, scaled_height), interpolation=cv2.INTER_AREA)
+
+    encoding_parameters = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
+    is_encode_successful, encoded_jpeg = cv2.imencode(".jpg", bgr_image, encoding_parameters)
+    
+    if is_encode_successful:
+        return encoded_jpeg.tobytes(), bgr_image.shape[0]
+    return None, 0
+
+def extract_and_send_payload_chunks(payload_bytes: bytes, frame_id: int, sender_socket, multicast_address):
+    max_payload_per_packet = MAXIMUM_DATAGRAM_SIZE_BYTES - HEADER_SIZE_IN_BYTES
+    total_chunks_required = (len(payload_bytes) + max_payload_per_packet - 1) // max_payload_per_packet or 1
+
+    for chunk_index in range(total_chunks_required):
+        start_byte_index = chunk_index * max_payload_per_packet
+        chunk_segment = payload_bytes[start_byte_index:start_byte_index + max_payload_per_packet]
+        packet_header = create_packet_header(frame_id, chunk_index, total_chunks_required, len(chunk_segment))
+        sender_socket.sendto(packet_header + chunk_segment, multicast_address)
+
+def broadcast_discovery_message(announcement_socket, announcement_message, current_image_height):
+    announcement_message["height"] = current_image_height if _is_encryption_active else 0
+    announcement_message["ts"] = time.time()
+    payload_json_bytes = json.dumps(announcement_message).encode("utf-8")
+    announcement_socket.sendto(payload_json_bytes, ("255.255.255.255", BROADCAST_DISCOVERY_PORT))
+
+
 def main():
-    ap = argparse.ArgumentParser(description="UDP Screen Share Server (multicast)")  # Initialize argument parser with description
-    ap.add_argument("--name", default="Server-1", help="Server display name")  # Add argument for server name with default
-    ap.add_argument("--group", default=DEFAULT_GROUP, help="Multicast group (239.x.x.x recommended)")  # Multicast group argument with default
-    ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="Multicast UDP port")  # UDP port argument with default
-    ap.add_argument("--fps", type=int, default=12, help="Target frames per second")  # FPS argument with default
-    ap.add_argument("--width", type=int, default=1280, help="Resize width (maintains aspect)")  # Width argument for resizing screen capture
-    ap.add_argument("--quality", type=int, default=60, help="JPEG quality (1-100)")  # JPEG quality argument with default
-    ap.add_argument("--no-ui", action="store_true", help="Do not launch the control interface")
-    args = ap.parse_args()  # Parse command-line arguments into args namespace
+    cli_parser = argparse.ArgumentParser(description="UDP Screen Share Server")
+    cli_parser.add_argument("--name", default="Server-1")
+    cli_parser.add_argument("--group", default=DEFAULT_MULTICAST_GROUP_IP)
+    cli_parser.add_argument("--port", type=int, default=DEFAULT_MULTICAST_PORT)
+    cli_parser.add_argument("--fps", type=int, default=12)
+    cli_parser.add_argument("--width", type=int, default=1280)
+    cli_parser.add_argument("--height", type=int, default=720)
+    cli_parser.add_argument("--quality", type=int, default=60)
+    cli_parser.add_argument("--no-ui", action="store_true")
+    arguments = cli_parser.parse_args()
 
-    ui_proc = None
-    if not args.no_ui:
-        try:
-            ui_path = Path(__file__).with_name("InterFace.py")
-            ui_proc = subprocess.Popen([sys.executable, str(ui_path)])
-        except Exception as ex:
-            print(f"[UI] Failed to launch InterFace.py: {ex}")
+    ui_process_handle = None
+    if not arguments.no_ui:
+        ui_process_handle = start_ui_process()
 
-    sender, maddr = make_multicast_sender(args.group, args.port)  # Create multicast sender socket and address tuple
-    ann_sock, ann_msg = broadcaster(args.name, args.group, args.port, args.fps, args.width, 0)
+    multicast_sender_socket, multicast_address_tuple = create_multicast_sender_socket(arguments.group, arguments.port)
+    discovery_socket, announcement_message_dict = create_discovery_broadcaster(
+        arguments.name, arguments.group, arguments.port, arguments.fps, arguments.width
+    )
 
-    # Control socket to receive commands from the UI (localhost only)
-    control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    control_sock.bind((CONTROL_HOST, CONTROL_PORT))
-    control_sock.setblocking(False)
+    local_control_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    local_control_socket.bind((CONTROL_HOST, CONTROL_PORT))
+    local_control_socket.setblocking(False)
 
-    sct = mss()  # Initialize MSS screen capture instance
-    monitor = sct.monitors[0]  # Select the full virtual screen (all monitors combined)
-    frame_id = 0  # Initialize frame ID counter
-    period = 1.0 / max(1, args.fps)  # Calculate time period per frame to achieve target FPS, avoid division by zero
-    last_announce = 0.0  # Timestamp of last announcement sent
-    send_screenshots = True  # or False
+    screen_capture_tool = mss()
+    primary_monitor = screen_capture_tool.monitors[0]
+    current_frame_id = 0
+    target_frame_duration_seconds = 1.0 / max(1, arguments.fps)
+    timestamp_of_last_announcement = 0.0
 
     try:
-        while True:  # Infinite loop to capture and send frames continuously
-            t0 = time.time()  # Record start time of this loop iteration
+        while True:
+            loop_start_time = time.time()
 
-            # Poll UI control messages (non-blocking)
-            try:
-                cmd, _ = control_sock.recvfrom(1024)
-                cmd = cmd.strip()
+            process_control_socket_commands(local_control_socket, multicast_sender_socket, multicast_address_tuple)
 
-                if cmd.startswith(CONTROL_SET_PASSWORD_PREFIX):
-                    pw_bytes = cmd[len(CONTROL_SET_PASSWORD_PREFIX):]
-                    try:
-                        pw = pw_bytes.decode("utf-8", errors="ignore")
-                    except Exception:
-                        pw = ""
-                    pw = (pw or "").strip()
-                    print(f"[CONTROL] Received password message (len={len(pw)})")
-                    set_password_encryption(pw)
-
-                elif cmd == CONTROL_TOGGLE_STOP:
-                    toggleStopSender(sender, maddr)
-                elif cmd == CONTROL_TOGGLE_GO:
-                    toggleGoSender(sender, maddr)
-                elif cmd == CONTROL_FREEZE:
-                    send_freeze_ten_times(sender, maddr)
-                elif cmd == CONTROL_UNFREEZE:
-                    send_unfreeze_ten_times(sender, maddr)
-                elif cmd == CONTROL_DEATH:
-                    send_death_message(sender, maddr)
-            except BlockingIOError:
-                pass
-            except Exception:
-                pass
-
-            # If the UI hasn't provided the password yet, we still ANNOUNCE the server
-            # (so discovery works), but we skip sending frames to avoid unencrypted output.
-            if _crypto_enabled:
-                # Grab screen
-                raw = sct.grab(monitor)  # Capture the screen contents of the selected monitor region
-                img = np.array(raw)  # Convert raw capture to a numpy array (BGRA format)
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)  # Convert BGRA image to BGR format (drop alpha channel)
-
-                # Resize keeping aspect
-                if args.width and img.shape[1] != args.width:  # If desired width is set and different from current width
-                    h = int(img.shape[0] * (args.width / img.shape[1]))  # Calculate new height to maintain aspect ratio
-                    img = cv2.resize(img, (args.width, h), interpolation=cv2.INTER_AREA)  # Resize image to new dimensions
-
-                # Encode JPEG
-                encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), args.quality]  # Set JPEG encoding parameters with quality level
-                ok, jpg = cv2.imencode(".jpg", img, encode_params)  # Encode the image as JPEG, returns success flag and encoded image
-                if not ok:  # If encoding failed
-                    time.sleep(0.01)
-                else:
-                    payload = jpg.tobytes()  # Convert encoded JPEG to bytes for transmission
-
-                    # Encrypt the frame bytes if a password was set via the UI.
-                    payload = encrypt_frame_bytes(payload, frame_id)
-
-                    # Chunk into UDP-sized pieces
-                    max_payload = MAX_DATAGRAM - HEADER_SIZE  # subtract protocol header size
-                    total_chunks = (len(payload) + max_payload - 1) // max_payload or 1  # Calculate number of chunks needed to send entire payload
-
-                    for idx in range(total_chunks):  # Iterate over each chunk index
-                        start = idx * max_payload  # Calculate start byte of this chunk
-                        part = payload[start:start + max_payload]  # Extract chunk bytes from payload
-                        header = pack_header(frame_id, idx, total_chunks, len(part))  # Pack header with frame ID, chunk index, total chunks, and chunk size
-                        sender.sendto(header + part, maddr)  # Send the header and chunk data as a UDP packet to multicast address
-
-                    frame_id = (frame_id + 1) & 0xFFFFFFFF  # Increment frame ID and wrap around at 32-bit unsigned int max
+            if _is_encryption_active:
+                jpeg_bytes, image_height = capture_and_encode_screen(screen_capture_tool, primary_monitor, arguments.width, arguments.quality)
+                
+                if jpeg_bytes:
+                    encrypted_payload = encrypt_payload(jpeg_bytes, current_frame_id)
+                    extract_and_send_payload_chunks(encrypted_payload, current_frame_id, multicast_sender_socket, multicast_address_tuple)
+                    current_frame_id = (current_frame_id + 1) & 0xFFFFFFFF
             else:
-                # No password yet; don't send frames.
+                image_height = 0
                 time.sleep(0.01)
 
-            # Broadcast presence ~once/sec
-            now = time.time()  # Get current time
-            if now - last_announce > 1.0:
-                ann_msg["height"] = img.shape[0] if _crypto_enabled else 0
-                ann_msg["ts"] = now
-                ann_payload = json.dumps(ann_msg).encode("utf-8")
-                ann_sock.sendto(ann_payload, ("255.255.255.255", ANNOUNCE_PORT))
-                last_announce = now
+            current_time = time.time()
+            if current_time - timestamp_of_last_announcement > 1.0:
+                broadcast_discovery_message(discovery_socket, announcement_message_dict, image_height)
+                timestamp_of_last_announcement = current_time
 
-            # Throttle to FPS
-            elapsed = time.time() - t0  # Calculate elapsed time for this loop iteration
-            sleep = period - elapsed  # Calculate remaining time to sleep to maintain target FPS
-            if sleep > 0:  # If there is time left to sleep
-                time.sleep(sleep)
+            elapsed_processing_time = time.time() - loop_start_time
+            sleep_duration = target_frame_duration_seconds - elapsed_processing_time
+            if sleep_duration > 0:
+                time.sleep(sleep_duration)
+                
     except KeyboardInterrupt:
         pass
     finally:
-        try:
-            sender.close()
-        except Exception:
-            pass
-        try:
-            ann_sock.close()
-        except Exception:
-            pass
-        try:
-            control_sock.close()
-        except Exception:
-            pass
-        if ui_proc is not None:
+        for resource in [multicast_sender_socket, discovery_socket, local_control_socket]:
             try:
-                ui_proc.terminate()
+                resource.close()
+            except Exception:
+                pass
+        if ui_process_handle is not None:
+            try:
+                ui_process_handle.terminate()
             except Exception:
                 pass
 
 if __name__ == "__main__":
-    main()  # Run main function if this script is executed directly
+    main()

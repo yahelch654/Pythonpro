@@ -1,339 +1,298 @@
-# This client connects to a multicast screensharing server, receives UDP packets,
-# reassembles fragmented JPEG frames, decodes them, and displays the video stream in real time.
-# client.py
 import json
 import socket
 import struct
 import subprocess
 import time
-from collections import defaultdict
-
 import cv2
 import numpy as np
 import pynput
 
-from proto import unpack_header, ANNOUNCE_PORT, HEADER_SIZE
+from proto import extract_header_and_payload, BROADCAST_DISCOVERY_PORT, HEADER_SIZE_IN_BYTES
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+from Crypto.Cipher import AES as PYAES
+from Crypto.Protocol.KDF import PBKDF2 as PYPBKDF2
+from Crypto.Hash import SHA256 as PYSHA256
 
-# Symmetric decryption (password-derived key). Matches server.py AES-GCM + PBKDF2.
-# Preferred backend: `cryptography` (AESGCM). Fallback: `pycryptodome` (AES GCM).
-try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    from cryptography.hazmat.primitives import hashes
-except Exception:
-    AESGCM = None
-    PBKDF2HMAC = None
-    hashes = None
+ENC_MAGIC = b"ENC1"
 
-# Fallback backend (often installed as `pycryptodome`)
-try:
-    from Crypto.Cipher import AES as PYAES
-    from Crypto.Protocol.KDF import PBKDF2 as PYPBKDF2
-    from Crypto.Hash import SHA256 as PYSHA256
-except Exception:
-    PYAES = None
-    PYPBKDF2 = None
-    PYSHA256 = None
+_crypto_keys_cache = {}
 
-ENC_MAGIC = b"ENC1"  # server prepends this when encryption is enabled
+def get_crypto_backend_and_key_for_salt(password: str, salt_bytes: bytes):
+    if not password:
+        return None
+    if salt_bytes in _crypto_keys_cache:
+        return _crypto_keys_cache[salt_bytes]
 
+    password_bytes = password.encode("utf-8")
 
-# Listen for broadcast announcements from servers to automatically discover available screen-share hosts.
-# Each server periodically sends JSON metadata containing its name, group, port, and video resolution.
-def discover_servers(timeout=5.0):
-    # Create UDP socket and bind to the announcement port so we can hear broadcast messages.
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("", ANNOUNCE_PORT))
-    sock.settimeout(timeout)
-
-    found = {}
-    end = time.time() + timeout
-    # Loop for the duration of the timeout, collecting any announcement packets.
-    while time.time() < end:
+    if AESGCM is not None and PBKDF2HMAC is not None and hashes is not None:
         try:
-            data, addr = sock.recvfrom(2048)
-            msg = json.loads(data.decode("utf-8"))
-            if msg.get("type") == "screenshare_announce":
-                name = msg.get("name", f"{addr[0]}:{msg.get('port')}")
-                found[name] = (msg["group"], int(msg["port"]), msg)
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=salt_bytes,
+                iterations=200_000,
+            )
+            derived_key = kdf.derive(password_bytes)
+            aesgcm_instance = AESGCM(derived_key)
+            _crypto_keys_cache[salt_bytes] = ("cryptography", aesgcm_instance)
+            return _crypto_keys_cache[salt_bytes]
+        except Exception:
+            pass
+
+    if PYAES is not None and PYPBKDF2 is not None and PYSHA256 is not None:
+        try:
+            derived_key = PYPBKDF2(password_bytes, salt_bytes, dkLen=32, count=200_000, hmac_hash_module=PYSHA256)
+            _crypto_keys_cache[salt_bytes] = ("pycryptodome", derived_key)
+            return _crypto_keys_cache[salt_bytes]
+        except Exception:
+            pass
+
+    return None
+
+def decrypt_payload_if_necessary(password: str, payload_blob: bytes, frame_id: int) -> bytes:
+    if not payload_blob or len(payload_blob) < 4:
+        return payload_blob
+    if not payload_blob.startswith(ENC_MAGIC):
+        return payload_blob
+
+    if len(payload_blob) < 4 + 16 + 12 + 16 + 1:
+        return b""
+        
+    salt_16_bytes = payload_blob[4:20]
+    nonce_12_bytes = payload_blob[20:32]
+    ciphertext_and_tag = payload_blob[32:]
+    
+    if len(ciphertext_and_tag) < 16:
+        return b""
+
+    associated_data = frame_id.to_bytes(4, "big", signed=False)
+
+    crypto_tuple = get_crypto_backend_and_key_for_salt(password, salt_16_bytes)
+    if crypto_tuple is None:
+        return b"" 
+
+    backend_name, backend_key_object = crypto_tuple
+    try:
+        if backend_name == "cryptography":
+            return backend_key_object.decrypt(nonce_12_bytes, ciphertext_and_tag, associated_data)
+
+        if backend_name == "pycryptodome":
+            ciphertext = ciphertext_and_tag[:-16]
+            authentication_tag = ciphertext_and_tag[-16:]
+            cipher = PYAES.new(backend_key_object, PYAES.MODE_GCM, nonce=nonce_12_bytes)
+            cipher.update(associated_data)
+            return cipher.decrypt_and_verify(ciphertext, authentication_tag)
+    except Exception:
+        return b""
+
+    return b""
+
+def discover_available_servers(timeout_seconds=5.0):
+    discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    discovery_socket.bind(("", BROADCAST_DISCOVERY_PORT))
+    discovery_socket.settimeout(timeout_seconds)
+
+    discovered_servers = {}
+    end_time = time.time() + timeout_seconds
+    
+    while time.time() < end_time:
+        try:
+            data_bytes, sender_address = discovery_socket.recvfrom(2048)
+            message_dict = json.loads(data_bytes.decode("utf-8"))
+            if message_dict.get("type") == "screenshare_announce":
+                server_name = message_dict.get("name", f"{sender_address[0]}:{message_dict.get('port')}")
+                discovered_servers[server_name] = (message_dict["group"], int(message_dict["port"]), message_dict)
         except socket.timeout:
             break
         except Exception:
             pass
-    sock.close()
-    return found
-def shutdown():
+            
+    discovery_socket.close()
+    return discovered_servers
+
+def shutdown_machine():
     subprocess.run(["shutdown", "-h"])
 
-
-stop_bool = True
-
-def stop(_=None):
-    global stop_bool
-    stop_bool = False
-
-def go(_=None):
-    global stop_bool
-    stop_bool = True
-
-def freeze(freeze_bool, keyboard_listener=None, mouse_listener=None):
-    # Source - https://stackoverflow.com/a
-    # Posted by ProblemsLoop
-    # Retrieved 2026-01-09, License - CC BY-SA 4.0
-    if freeze_bool:
-        # Disable mouse and keyboard events
+def toggle_input_freeze(should_freeze: bool, keyboard_listener=None, mouse_listener=None):
+    if should_freeze:
         mouse_listener = pynput.mouse.Listener(suppress=True)
         mouse_listener.start()
         keyboard_listener = pynput.keyboard.Listener(suppress=True)
         keyboard_listener.start()
-    elif freeze_bool==False:
-        # Enable mouse and keyboard events
-        mouse_listener.stop()
-        keyboard_listener.stop()
+    else:
+        if mouse_listener: mouse_listener.stop()
+        if keyboard_listener: keyboard_listener.stop()
 
+def connect_to_multicast_group(group_ip: str, port: int):
+    multicast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    multicast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-# Join a multicast group so we can receive the actual video stream.
-# Multicast allows many clients to receive the same video feed without additional load on the server.
-def join_multicast(group: str, port: int):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    # Bind to the port so we can receive packets sent to the multicast group.
-    # Some platforms require binding directly to the multicast address.
     try:
-        s.bind(("", port))
+        multicast_socket.bind(("", port))
     except OSError:
-        # On Windows you may need to bind to the group addr
-        s.bind((group, port))
+        multicast_socket.bind((group_ip, port))
 
-    mreq = struct.pack("=4sl", socket.inet_aton(group), socket.INADDR_ANY)
-    s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-    # (Optional) increase receive buffer
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
-    s.settimeout(3.0)
-    return s
+    multicast_request_bytes = struct.pack("=4sl", socket.inet_aton(group_ip), socket.INADDR_ANY)
+    multicast_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, multicast_request_bytes)
+    multicast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+    multicast_socket.settimeout(3.0)
+    
+    return multicast_socket
 
-
-# Main entry point for the client: discovers servers, connects, receives frames, and displays video.
-def main():
-    # Attempt automatic discovery first; if no servers respond, request manual input from user.
+def prompt_user_for_server_selection():
     print("Discovering servers for 5 seconds...")
-    servers = discover_servers(timeout=5.0)
-    if not servers:
+    available_servers = discover_available_servers(timeout_seconds=5.0)
+    
+    if not available_servers:
         print("No servers found. You can still connect if you know group/port.")
-        group = input("Multicast group [e.g., 11.42.56.219]: ").strip()
+        group_ip = input("Multicast group [e.g., 239.10.10.10]: ").strip()
         port = int(input("Port [e.g., 5004]: ").strip())
-    else:
-        print("\nAvailable servers:")
-        for i, (name, (_, __, meta)) in enumerate(servers.items(), 1):
-            print(
-                f"{i}. {name}  @ {meta['group']}:{meta['port']}  ({meta['width']}x{meta['height']} ~{meta['fps']}fps)")
-        choice = input("Select number (or press Enter for 1): ").strip() or "1"
-        idx = int(choice) - 1
-        key = list(servers.keys())[idx]
-        group, port, meta = servers[key]
-        print(f"Connecting to {key} @ {group}:{port}")
+        return group_ip, port
 
-    if servers:
-        pass
-    else:
-        meta = {"width": 0, "height": 0, "fps": 0}
-    s = join_multicast(group, port)
+    print("\nAvailable servers:")
+    server_names = list(available_servers.keys())
+    for index, server_name in enumerate(server_names, 1):
+        _, _, metadata = available_servers[server_name]
+        print(f"{index}. {server_name}  @ {metadata['group']}:{metadata['port']}  ({metadata['width']}x{metadata['height']} ~{metadata['fps']}fps)")
+        
+    choice = input("Select number (or press Enter for 1): ").strip() or "1"
+    selected_index = int(choice) - 1
+    selected_server_key = server_names[selected_index]
+    selected_group_ip, selected_port, _ = available_servers[selected_server_key]
+    
+    print(f"Connecting to {selected_server_key} @ {selected_group_ip}:{selected_port}")
+    return selected_group_ip, selected_port
+
+def handle_remote_commands(packet_bytes: bytes, is_video_playing: bool, stop_video_callback, resume_video_callback) -> str:
+    try:
+        command_string = packet_bytes.decode("utf-8").strip().lower()
+
+        if command_string == "go":
+            resume_video_callback()
+            return "command_go"
+        if command_string == "stop":
+            stop_video_callback()
+            return "command_stop"
+        if command_string == "freeze":
+            toggle_input_freeze(True)
+            return "command_freeze"
+        if command_string == "unfreeze":
+            toggle_input_freeze(False)
+            return "command_unfreeze"
+        if command_string == "death":
+            shutdown_machine()
+            return "command_death"
+            
+        return ""
+    except UnicodeDecodeError:
+        return ""
+
+def reassemble_and_display_frame(frame_buffer_dict: dict, total_chunks: int, frame_id: int, password: str, is_video_playing: bool) -> bool:
+    chunk_pieces = [frame_buffer_dict[i] for i in range(total_chunks)]
+    full_jpeg_bytes = b"".join(chunk_pieces)
+
+    decrypted_jpeg_bytes = decrypt_payload_if_necessary(password, full_jpeg_bytes, frame_id)
+    if not decrypted_jpeg_bytes:
+        return False
+
+    image_array = np.frombuffer(decrypted_jpeg_bytes, dtype=np.uint8)
+    decoded_frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    
+    if decoded_frame is not None:
+        if is_video_playing:
+            cv2.imshow("UDP Screen Share", decoded_frame)
+        if cv2.waitKey(1) == 27:  # ESC to quit
+            return True # signal to quit
+            
+    return False
+
+def main():
+    group_ip, port = prompt_user_for_server_selection()
+    multicast_socket = connect_to_multicast_group(group_ip, port)
     print("Client connected to the server.")
 
-    # Password for decrypting frames (must match the server UI password).
-    # The server will NOT send frames until encryption is enabled.
-    password = ""
     try:
-        password = input("Password (required): ").strip()
+        server_password = input("Password (required): ").strip()
     except Exception:
-        password = ""
+        server_password = ""
 
-    # Cache derived keys per-salt so we don't run PBKDF2 every frame.
-    # Value is a tuple: (backend_name, backend_obj)
-    #   backend_name == "cryptography" -> backend_obj is AESGCM
-    #   backend_name == "pycryptodome" -> backend_obj is raw key bytes
-    _crypto_by_salt = {}
+    incomplete_frames_buffer = {}
+    timestamp_of_last_completed_frame = time.time()
+    MAXIMUM_INCOMPLETE_FRAME_AGE_SECONDS = 1.5
 
-    def _get_crypto_for_salt(salt16: bytes):
-        if not password:
-            return None
-        if salt16 in _crypto_by_salt:
-            return _crypto_by_salt[salt16]
+    is_video_playing = True
 
-        pw_bytes = password.encode("utf-8")
+    def stop_video_callback():
+        nonlocal is_video_playing
+        is_video_playing = False
 
-        # --- Preferred backend: cryptography ---
-        if AESGCM is not None and PBKDF2HMAC is not None and hashes is not None:
-            try:
-                kdf = PBKDF2HMAC(
-                    algorithm=hashes.SHA256(),
-                    length=32,
-                    salt=salt16,
-                    iterations=200_000,
-                )
-                key = kdf.derive(pw_bytes)
-                a = AESGCM(key)
-                _crypto_by_salt[salt16] = ("cryptography", a)
-                return _crypto_by_salt[salt16]
-            except Exception:
-                pass
+    def resume_video_callback():
+        nonlocal is_video_playing
+        is_video_playing = True
 
-        # --- Fallback backend: pycryptodome ---
-        if PYAES is not None and PYPBKDF2 is not None and PYSHA256 is not None:
-            try:
-                key = PYPBKDF2(pw_bytes, salt16, dkLen=32, count=200_000, hmac_hash_module=PYSHA256)
-                _crypto_by_salt[salt16] = ("pycryptodome", key)
-                return _crypto_by_salt[salt16]
-            except Exception:
-                pass
+    packet_counters = {
+        "command_go": 0, "command_stop": 0, 
+        "command_freeze": 0, "command_unfreeze": 0, 
+        "command_death": 0, "ignored_short": 0, 
+        "video_chunk": 0
+    }
 
-        return None
-
-    def decrypt_if_needed(blob: bytes, frame_id: int) -> bytes:
-        """If blob starts with ENC1, decrypt it and return plaintext JPEG bytes."""
-        if not blob or len(blob) < 4:
-            return blob
-        if not blob.startswith(ENC_MAGIC):
-            return blob
-
-        # Format: ENC1 + salt(16) + nonce(12) + ciphertext + tag(16)
-        if len(blob) < 4 + 16 + 12 + 16 + 1:
-            return b""  # malformed
-        salt16 = blob[4:20]
-        nonce12 = blob[20:32]
-        ct_and_tag = blob[32:]
-        if len(ct_and_tag) < 16:
-            return b""
-
-        aad = frame_id.to_bytes(4, "big", signed=False)
-
-        crypto = _get_crypto_for_salt(salt16)
-        if crypto is None:
-            return b""  # can't decrypt
-
-        backend, obj = crypto
-        try:
-            if backend == "cryptography":
-                # AESGCM expects ciphertext+tag concatenated
-                return obj.decrypt(nonce12, ct_and_tag, aad)
-
-            if backend == "pycryptodome":
-                # Split ciphertext/tag for pycryptodome verify
-                ciphertext = ct_and_tag[:-16]
-                tag = ct_and_tag[-16:]
-                cipher = PYAES.new(obj, PYAES.MODE_GCM, nonce=nonce12)
-                cipher.update(aad)
-                return cipher.decrypt_and_verify(ciphertext, tag)
-        except Exception:
-            return b""
-
-        return b""
-
-    # Per-frame reassembly context:
-    # current_frames = maps frame_id -> (dict of chunk_index -> bytes, set of received indexes)
-    # chunk_counters   = counts chunks received per frame (for debugging or diagnostics)
-    # MAX_STASH_AGE    = how long we keep incomplete frames before discarding them
-    current_frames = {}
-    chunk_counters = defaultdict(int)
-    last_completed = time.time()
-    MAX_STASH_AGE = 1.5  # seconds
+    def print_packet_summary():
+        print(f"(death: {packet_counters['command_death']} | freeze {packet_counters['command_freeze']} | unfreeze {packet_counters['command_unfreeze']} | go {packet_counters['command_go']} | stop {packet_counters['command_stop']} | video {packet_counters['video_chunk']} | ignored {packet_counters['ignored_short']})")
 
     try:
         while True:
-            # Receive next UDP packet. Each packet contains a header followed by one JPEG fragment.
             try:
-                pkt, addr = s.recvfrom(2048)
-                print("got", len(pkt), "bytes from", addr)
-                # --- command handling (STOP / FREEZE) ---
-                try:
-                    cmd = pkt.decode("utf-8").strip().lower()
-
-                    if cmd == "go":
-                        print("Got go")
-                        go(stop_bool)
-                        continue
-
-                    if cmd == "stop":
-                        print("Got stop")
-                        stop(stop_bool)  # call stop function
-                        continue  # skip video handling
-
-                    if cmd == "freeze":
-                        freeze(True)  # call freeze function
-                        continue
-
-                    if cmd == "unfreeze":
-                        freeze(False)
-                        continue
-
-                    # Server sends "death" (not "dead")
-                    if cmd == "death":
-                        shutdown()
-                        continue
-
-                except UnicodeDecodeError:
-                    pass  # not a text command, continue as normal
+                packet_bytes, sender_address = multicast_socket.recvfrom(2048)
+                
+                command_type = handle_remote_commands(packet_bytes, is_video_playing, stop_video_callback, resume_video_callback)
+                if command_type:
+                    packet_counters[command_type] += 1
+                    print_packet_summary()
+                    continue
+                    
             except socket.timeout:
-                print("recv timeout (no UDP packets)")
-                # If idle, keep window responsive
-                if cv2.waitKey(1) == 27:  # ESC
+                if cv2.waitKey(1) == 27:
                     break
                 continue
 
-            # Ignore any packet that is too small to contain our header
-            if len(pkt) < HEADER_SIZE:
+            if len(packet_bytes) < HEADER_SIZE_IN_BYTES:
+                packet_counters["ignored_short"] += 1
+                print_packet_summary()
                 continue
+                
+            packet_counters["video_chunk"] += 1
+            print_packet_summary()
 
-            (frame_id, chunk_idx, total_chunks, payload_len, _), payload = unpack_header(pkt)
-            # The header tells us which frame this chunk belongs to, its index, and how many total chunks exist.
-            payload = payload[:payload_len]
+            parsed_header_tuple, payload_segment = extract_header_and_payload(packet_bytes)
+            frame_id, chunk_index, total_chunks, payload_length, _ = parsed_header_tuple
+            payload_segment = payload_segment[:payload_length]
 
-            # Look up or create storage for this frame.
-            # Frames arrive as multiple unordered chunks, so we store them individually until the frame is complete.
-            buf, received = current_frames.get(frame_id, (bytearray(), set()))
-            # Ensure buffer can fit in orderless appends; we’ll simply store chunks then concatenate later
-            # Store as dict of idx->bytes for correctness
-            if not received:
-                current_frames[frame_id] = (dict(), set())
-                buf, received = current_frames[frame_id]
-            buf[chunk_idx] = payload
-            received.add(chunk_idx)
+            if frame_id not in incomplete_frames_buffer:
+                incomplete_frames_buffer[frame_id] = (dict(), set())
+                
+            frame_chunks_dict, received_chunk_indices_set = incomplete_frames_buffer[frame_id]
+            frame_chunks_dict[chunk_index] = payload_segment
+            received_chunk_indices_set.add(chunk_index)
 
-            # All chunks for this frame have arrived — time to reassemble the JPEG image.
-            if len(received) == total_chunks:
-                # Reassemble chunk list in correct order and combine into a full JPEG byte sequence.
-                parts = [buf[i] for i in range(total_chunks)]
-                jpg = b"".join(parts)
+            if len(received_chunk_indices_set) == total_chunks:
+                should_quit = reassemble_and_display_frame(frame_chunks_dict, total_chunks, frame_id, server_password, is_video_playing)
+                if should_quit:
+                    break
+                    
+                del incomplete_frames_buffer[frame_id]
+                timestamp_of_last_completed_frame = time.time()
 
-                # If encrypted, decrypt to obtain the original JPEG bytes.
-                jpg = decrypt_if_needed(jpg, frame_id)
-                if not jpg:
-                    del current_frames[frame_id]
-                    last_completed = time.time()
-                    continue
-
-                # Decode the JPEG bytes into an OpenCV BGR image.
-                arr = np.frombuffer(jpg, dtype=np.uint8)
-                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                # Display the decoded frame in a window. ESC closes the stream.
-                if frame is not None:
-                    if stop_bool:
-                        cv2.imshow("UDP Screen Share", frame)
-                    if cv2.waitKey(1) == 27:  # ESC to quit
-                        break
-                # cleanup completed
-                del current_frames[frame_id]
-                last_completed = time.time()
-
-            # Discard all incomplete frames if nothing has completed recently. Prevents memory buildup on packet loss.
-            if time.time() - last_completed > MAX_STASH_AGE:
-                current_frames.clear()
+            if time.time() - timestamp_of_last_completed_frame > MAXIMUM_INCOMPLETE_FRAME_AGE_SECONDS:
+                incomplete_frames_buffer.clear()
+                
     finally:
-        s.close()
+        multicast_socket.close()
         cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
     main()
